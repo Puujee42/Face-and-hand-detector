@@ -15,54 +15,88 @@ if not os.path.exists(model_path):
     urllib.request.urlretrieve(url, model_path)
     print("Download complete!")
 
-# --- STEP 2: CUSTOM DRAWING FUNCTION (No mp.solutions) ---
+# --- STEP 2: CUSTOM DRAWING (Highlight Eyes) ---
 def draw_face_landmarks_manual(image, landmarks):
-    """
-    Draws dots for face landmarks using standard OpenCV.
-    We don't use mp.solutions.drawing_utils here.
-    """
     h, w, _ = image.shape
     
-    # Loop through all 478 landmarks and draw a tiny dot for each
-    for lm in landmarks:
-        # Convert normalized coordinates (0.0 to 1.0) to pixels
+    # MediaPipe Face Mesh Indices for Eyes (Approximate outline)
+    # Left Eye: 33, 133, 157, 158, 159, 160, 161, 246...
+    # Right Eye: 362, 263, 384, 385, 386, 387, 388, 466...
+    # Simple range check: Eyes are mostly indices 33-246 and 362-478
+    # We will just color specific ranges to highlight eyes.
+
+    for i, lm in enumerate(landmarks):
         cx, cy = int(lm.x * w), int(lm.y * h)
         
-        # Draw a small yellow dot
-        cv2.circle(image, (cx, cy), 1, (0, 255, 255), -1)
+        # Color Logic:
+        # Iris/Pupils are usually the last landmarks (468-477)
+        # Eye contours are generally scattered, but we'll highlight the Irises specifically.
+        
+        if i >= 468: 
+            # IRISES (Cyan - Big Dots)
+            cv2.circle(image, (cx, cy), 3, (255, 255, 0), -1)
+        else:
+            # REST OF FACE (Yellow - Small Dots)
+            cv2.circle(image, (cx, cy), 1, (0, 255, 255), -1)
 
-# --- STEP 3: EMOTION LOGIC (Blendshapes) ---
-def get_emotion(blendshapes):
-    # Convert list of categories to a dictionary for easier lookup
+# --- STEP 3: ADVANCED EMOTION LOGIC ---
+def get_emotion_with_eyes(blendshapes):
     scores = {b.category_name: b.score for b in blendshapes}
 
-    # Extract muscle movements
+    # --- 1. GET BASIC MUSCLE GROUPS ---
     smile = (scores.get('mouthSmileLeft', 0) + scores.get('mouthSmileRight', 0)) / 2
     brow_down = (scores.get('browDownLeft', 0) + scores.get('browDownRight', 0)) / 2
-    frown = (scores.get('mouthFrownLeft', 0) + scores.get('mouthFrownRight', 0)) / 2
     brow_inner_up = scores.get('browInnerUp', 0)
     sneer = (scores.get('noseSneerLeft', 0) + scores.get('noseSneerRight', 0)) / 2
-    eye_blink = (scores.get('eyeBlinkLeft', 0) + scores.get('eyeBlinkRight', 0)) / 2
     jaw_open = scores.get('jawOpen', 0)
+    
+    # --- 2. GET EYE SPECIFICS (The New Logic) ---
+    # eyeBlink: 0 = Open, 1 = Closed
+    eye_blink = (scores.get('eyeBlinkLeft', 0) + scores.get('eyeBlinkRight', 0)) / 2
+    
+    # eyeWide: 0 = Neutral, 1 = Very Wide (Shock)
+    eye_wide = (scores.get('eyeLookUpLeft', 0) + scores.get('eyeLookUpRight', 0)) / 2 + \
+               (scores.get('eyeWideLeft', 0) + scores.get('eyeWideRight', 0)) / 2
+               
+    # eyeSquint: 0 = Neutral, 1 = Squinting (Suspicion/Real Smile)
+    eye_squint = (scores.get('eyeSquintLeft', 0) + scores.get('eyeSquintRight', 0)) / 2
 
-    # Determine Emotion
+    # --- 3. COMPLEX LOGIC CHAIN ---
+    
+    # PRIORITY 1: EXTREME EYE STATES
+    if eye_wide > 0.5 and jaw_open > 0.4:
+        return "SHOCKED", (255, 255, 0) # Cyan
+    
+    if eye_wide > 0.6 and brow_inner_up > 0.4:
+        # Wide eyes + Inner brows up = Fear
+        return "FEAR / TERRIFIED", (128, 0, 128) # Purple
+    
+    if eye_squint > 0.6 and smile < 0.2:
+        # Squinting without smiling = Suspicion
+        return "SUSPICIOUS", (0, 165, 255) # Orange
+
+    # PRIORITY 2: MOUTH & BROWS
     if sneer > 0.4:
         return "DISGUSTED", (0, 0, 255) # Red
     
     if brow_down > 0.5:
-        return "ANGRY", (0, 0, 139) # Dark Blue
+        # If brows are down AND eyes are squinting, it's intense anger
+        if eye_squint > 0.3:
+            return "FURIOUS", (0, 0, 139) # Dark Blue
+        return "ANGRY", (0, 0, 255) # Blue
     
     if smile > 0.4:
-        return "HAPPY", (0, 255, 0) # Green
+        # Duchenne Smile Check: Real smiles involve squinting eyes
+        if eye_squint > 0.3:
+            return "HAPPY (Real Smile)", (0, 255, 0) # Green
+        else:
+            return "HAPPY (Fake Smile)", (50, 205, 50) # Lime Green
     
-    if frown > 0.4 or (brow_inner_up > 0.4):
+    if scores.get('mouthFrownLeft', 0) > 0.4 or brow_inner_up > 0.5:
         return "SAD", (255, 0, 0) # Blue
     
-    if jaw_open > 0.3 and eye_blink < 0.2:
-        return "SURPRISED", (255, 255, 0) # Cyan
-
     if eye_blink > 0.4:
-        return "SLEEPY/BORED", (128, 128, 128) # Gray
+        return "SLEEPY", (128, 128, 128) # Gray
 
     return "NEUTRAL", (200, 200, 200) # Light Gray
 
@@ -71,7 +105,7 @@ def run_face_emotion():
     base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
-        output_face_blendshapes=True, # We need this for emotions
+        output_face_blendshapes=True,
         output_facial_transformation_matrixes=False,
         num_faces=1,
         running_mode=vision.RunningMode.VIDEO
@@ -89,36 +123,40 @@ def run_face_emotion():
             ret, frame = cap.read()
             if not ret: break
 
-            # Flip and Convert
             frame = cv2.flip(frame, 1)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
             timestamp_ms = int(time.time() * 1000)
 
-            # Detect
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-            # Visualization
             if result.face_landmarks:
-                # 1. Draw Landmarks manually (Yellow Dots)
-                # We access index 0 because we set num_faces=1
                 draw_face_landmarks_manual(frame, result.face_landmarks[0])
 
-                # 2. Check Emotions
                 if result.face_blendshapes:
                     blendshapes = result.face_blendshapes[0]
-                    text, color = get_emotion(blendshapes)
+                    text, color = get_emotion_with_eyes(blendshapes)
                     
-                    # Draw UI
-                    cv2.rectangle(frame, (0, 0), (350, 60), (0,0,0), -1)
-                    cv2.putText(frame, text, (20, 45), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                    # --- UI DISPLAY ---
+                    # Background Box
+                    cv2.rectangle(frame, (0, 0), (450, 80), (0,0,0), -1)
+                    
+                    # Main Emotion
+                    cv2.putText(frame, text, (20, 50), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+                    
+                    # Debug Info: Show Eye Stats in small text
+                    scores = {b.category_name: b.score for b in blendshapes}
+                    e_wide = (scores.get('eyeWideLeft',0) + scores.get('eyeWideRight',0))/2
+                    e_squint = (scores.get('eyeSquintLeft',0) + scores.get('eyeSquintRight',0))/2
+                    
+                    debug_text = f"Eye Wide: {e_wide:.2f} | Eye Squint: {e_squint:.2f}"
+                    cv2.putText(frame, debug_text, (20, 75), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            cv2.imshow('Face Emotion Detector (Tasks API)', frame)
+            cv2.imshow('Advanced Emotion Detector', frame)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
-                break
+            if cv2.waitKey(1) & 0xFF == 27: break
 
     cap.release()
     cv2.destroyAllWindows()
