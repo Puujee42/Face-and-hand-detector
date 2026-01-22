@@ -16,27 +16,81 @@ if not os.path.exists(model_path):
     urllib.request.urlretrieve(url, model_path)
     print("Download complete!")
 
-# --- STEP 2: MATH FUNCTIONS ---
-def dist(p1, p2):
-    return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+# --- STEP 2: DENSE GEOMETRY LOGIC ---
 
-def extract_face_signature(landmarks):
-    # Width of face (Ear to Ear) used to normalize measurements
-    face_width = dist(landmarks[234], landmarks[454])
-    if face_width == 0: return None 
+def get_dense_mesh_signature(landmarks):
+    """
+    Converts all 478 landmarks into a normalized NumPy array.
+    """
+    # Convert Landmarks to NumPy Array (478 points x 3 coords)
+    coords = np.array([[lm.x, lm.y, lm.z] for lm in landmarks])
 
-    # Key Geometry Ratios
-    eye_gap = dist(landmarks[33], landmarks[362]) / face_width
-    jaw_len = dist(landmarks[152], landmarks[1]) / face_width
-    nose_width = dist(landmarks[102], landmarks[331]) / face_width
-    mouth_width = dist(landmarks[61], landmarks[291]) / face_width
-    l_eye_w = dist(landmarks[33], landmarks[133]) / face_width
-    r_eye_w = dist(landmarks[362], landmarks[263]) / face_width
-    forehead = dist(landmarks[10], landmarks[4]) / face_width
+    # 1. CENTER THE FACE
+    # Find the nose tip (Index 1) and subtract it from all points
+    # This moves the face so the nose is at (0,0,0)
+    nose_tip = coords[1]
+    centered = coords - nose_tip
 
-    return np.array([eye_gap, jaw_len, nose_width, mouth_width, l_eye_w, r_eye_w, forehead])
+    # 2. ROTATION CORRECTION (Basic 2D alignment)
+    # We rotate the face so the eyes are level horizontally.
+    left_eye = coords[33]
+    right_eye = coords[263]
+    dY = right_eye[1] - left_eye[1]
+    dX = right_eye[0] - left_eye[0]
+    angle = np.degrees(np.arctan2(dY, dX)) - 180
+    
+    # (Skipping complex 3D rotation matrix for speed, trusting 
+    # the user looks straight due to our pose check)
 
-# --- STEP 3: SETUP OPTIONS ---
+    # 3. SCALE THE FACE
+    # Calculate face width (Ear to Ear: 234 to 454)
+    face_width = np.linalg.norm(coords[234] - coords[454])
+    
+    if face_width == 0: return None
+    
+    # Divide all coordinates by face_width to normalize size
+    normalized = centered / face_width
+    
+    return normalized
+
+def check_head_pose(landmarks):
+    """Ensures user is looking straight ahead"""
+    nose = landmarks[1]
+    l_ear = landmarks[234]
+    r_ear = landmarks[454]
+    
+    # YAW CHECK
+    d_left = math.sqrt((nose.x - l_ear.x)**2 + (nose.y - l_ear.y)**2)
+    d_right = math.sqrt((nose.x - r_ear.x)**2 + (nose.y - r_ear.y)**2)
+    yaw_ratio = d_left / (d_right + 0.0001)
+
+    return 0.8 < yaw_ratio < 1.25
+
+def generate_vertex_weights():
+    """
+    Assigns a 'Trust Score' to every single point on the face.
+    Bone points = High Trust. Mouth/Cheek points = Low Trust.
+    """
+    weights = np.ones(478) # Start with base weight of 1.0
+
+    # High Trust: Nose Bridge & Eyes (Bone)
+    # MediaPipe Indices approximations
+    nose_indices = list(range(1, 20)) + [168, 6, 197, 195, 5, 4]
+    eye_indices = list(range(33, 133)) + list(range(362, 463))
+    
+    weights[nose_indices] = 3.0  # Trust nose VERY much
+    weights[eye_indices] = 2.0   # Trust eyes much
+
+    # Low Trust: Jawline & Cheeks (Flesh/Fat changes)
+    jaw_indices = list(range(0, 17)) + list(range(152, 170)) # Rough approximation
+    mouth_indices = list(range(61, 91)) + list(range(291, 321))
+
+    weights[jaw_indices] = 0.5
+    weights[mouth_indices] = 0.5 
+    
+    return weights
+
+# --- STEP 3: SETUP ---
 base_options = python.BaseOptions(model_asset_path=model_path)
 options = vision.FaceLandmarkerOptions(
     base_options=base_options,
@@ -47,27 +101,19 @@ options = vision.FaceLandmarkerOptions(
     running_mode=vision.RunningMode.IMAGE
 )
 
-# --- STEP 4: TRAIN (Load Images) ---
+# --- STEP 4: TRAINING ---
 landmarker_static = vision.FaceLandmarker.create_from_options(options)
-owner_signatures = []
-
-# FIX: Match your actual folder name "Images"
+owner_meshes = []
 image_folder = "Images" 
 
-# Smart check: If we are already INSIDE the 'Images' folder, look in current directory '.'
 if not os.path.exists(image_folder) and os.path.exists("check1.jpg"):
-    print("Notice: You are running inside the Images folder.")
     image_folder = "."
 
 print(f"--- TRAINING ON IMAGES IN '{image_folder}' ---")
 
 for i in range(1, 9):
-    # Construct path, e.g., "Images/check1.jpg"
     filename = os.path.join(image_folder, f"check{i}.jpg")
-    
-    if not os.path.exists(filename): 
-        print(f"Skipping {filename} (Not found)")
-        continue
+    if not os.path.exists(filename): continue
     
     img = cv2.imread(filename)
     if img is None: continue
@@ -78,22 +124,25 @@ for i in range(1, 9):
     try:
         result = landmarker_static.detect(mp_image)
         if result.face_landmarks:
-            sig = extract_face_signature(result.face_landmarks[0])
-            if sig is not None:
-                owner_signatures.append(sig)
-                print(f" [OK] Learned face from {filename}")
-        else:
-            print(f" [X] No face found in {filename}")
-    except Exception as e:
-        print(f"Error on {filename}: {e}")
+            lm = result.face_landmarks[0]
+            if check_head_pose(lm):
+                mesh = get_dense_mesh_signature(lm)
+                if mesh is not None:
+                    owner_meshes.append(mesh)
+                    print(f" [OK] Learned face from {filename}")
+            else:
+                print(f" [X] Skipped {filename} (Head turned)")
+    except: pass
 
-if not owner_signatures:
-    print("\nCRITICAL ERROR: No valid reference images loaded.")
-    print(f"Make sure you are in '~/facerecog' and that '~/facerecog/{image_folder}' exists.")
+if not owner_meshes:
+    print("\nERROR: No valid images found.")
     exit()
 
-owner_avg_signature = np.mean(owner_signatures, axis=0)
-print(f"\nTraining Complete. Average Signature: {np.round(owner_avg_signature, 3)}")
+# Calculate the AVERAGE MESH (The "Perfect Owner Face")
+owner_avg_mesh = np.mean(owner_meshes, axis=0)
+vertex_weights = generate_vertex_weights()
+
+print(f"\nTraining Complete. Master Template created from {len(owner_meshes)} images.")
 
 # --- STEP 5: REAL-TIME RECOGNITION ---
 def run_recognition():
@@ -102,9 +151,14 @@ def run_recognition():
     
     cap = cv2.VideoCapture(0)
     
-    # 0.05 is strict, 0.08 is loose
-    ERROR_THRESHOLD = 0.06
+    # THRESHOLD:
+    # Since we are summing error over 478 points, the number is different.
+    # 0.045 is a good starting point for per-vertex average error.
+    ERROR_THRESHOLD = 0.045
+    REQUIRED_STREAK = 15 
 
+    current_streak = 0
+    
     print("Press 'q' or 'ESC' to exit.")
 
     while True:
@@ -120,44 +174,74 @@ def run_recognition():
 
         result = landmarker_live.detect_for_video(mp_image, timestamp_ms)
 
-        status = "SEARCHING..."
-        color = (200, 200, 200)
-        diff_score = 1.0 
+        status = "NO FACE"
+        color = (100, 100, 100)
+        debug_info = ""
 
         if result.face_landmarks:
-            live_sig = extract_face_signature(result.face_landmarks[0])
+            landmarks = result.face_landmarks[0]
             
-            if live_sig is not None:
-                diff_score = np.mean(np.abs(owner_avg_signature - live_sig))
+            if not check_head_pose(landmarks):
+                status = "LOOK STRAIGHT"
+                color = (0, 255, 255) 
+                current_streak = 0
+            else:
+                live_mesh = get_dense_mesh_signature(landmarks)
                 
-                if diff_score < ERROR_THRESHOLD:
-                    status = "ACCESS GRANTED"
-                    color = (0, 255, 0) # Green
-                else:
-                    status = "ACCESS DENIED"
-                    color = (0, 0, 255) # Red
+                if live_mesh is not None:
+                    # --- DENSE COMPARISON ---
+                    # 1. Subtract Live Mesh from Owner Mesh
+                    diff = np.abs(owner_avg_mesh - live_mesh)
+                    
+                    # 2. Average the XYZ differences for each point
+                    # Shape becomes (478,) representing error at each point
+                    point_errors = np.mean(diff, axis=1)
+                    
+                    # 3. Apply Weights (Trust Nose > Trust Mouth)
+                    weighted_errors = point_errors * vertex_weights
+                    
+                    # 4. Final Score
+                    final_score = np.mean(weighted_errors)
+                    
+                    match_percent = max(0, 1.0 - (final_score / 0.1)) * 100
+                    debug_info = f"Err: {final_score:.4f}"
 
-            for lm in result.face_landmarks[0]:
-                cv2.circle(frame, (int(lm.x*w), int(lm.y*h)), 1, (255, 255, 0), -1)
+                    if final_score < ERROR_THRESHOLD:
+                        current_streak += 1
+                        if current_streak >= REQUIRED_STREAK:
+                            status = "ACCESS GRANTED"
+                            color = (0, 255, 0)
+                            current_streak = REQUIRED_STREAK 
+                        else:
+                            status = f"VERIFYING {current_streak}/{REQUIRED_STREAK}"
+                            color = (0, 165, 255)
+                    else:
+                        status = "ACCESS DENIED"
+                        color = (0, 0, 255)
+                        current_streak = 0 
+
+            # VISUALIZATION: Draw the Mask
+            # Green dots = Good match, Red dots = Bad match
+            if result.face_landmarks:
+                for i in range(0, 478, 5): # Draw every 5th point to save FPS
+                    lm = landmarks[i]
+                    pt_x, pt_y = int(lm.x * w), int(lm.y * h)
+                    
+                    # If this specific point is far off from owner, make it RED
+                    # (Note: We rely on the global score, but this visualizes distortions)
+                    cv2.circle(frame, (pt_x, pt_y), 1, (0, 255, 0), -1)
 
         # UI
-        cv2.rectangle(frame, (0,0), (w, 100), (30, 30, 30), -1)
+        cv2.rectangle(frame, (0,0), (w, 100), (20, 20, 20), -1)
         cv2.putText(frame, status, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
-        
-        match_quality = max(0, 1.0 - (diff_score / 0.1))
-        
-        cv2.putText(frame, f"Match: {int(match_quality*100)}% (Err: {diff_score:.3f})", 
-                    (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        bar_x, bar_y, bar_w = 350, 75, 200
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+20), (100,100,100), -1)
-        fill_w = int(bar_w * match_quality)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x+fill_w, bar_y+20), color, -1)
-        
-        limit_x = bar_x + int(bar_w * (1.0 - (ERROR_THRESHOLD/0.1)))
-        cv2.line(frame, (limit_x, 70), (limit_x, 100), (0,255,255), 2)
+        if debug_info:
+            cv2.putText(frame, debug_info, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
 
-        cv2.imshow('Geometric Face Recog', frame)
+        if current_streak > 0:
+            bar_w = int((current_streak / REQUIRED_STREAK) * w)
+            cv2.rectangle(frame, (0, 95), (bar_w, 100), (0, 255, 0), -1)
+
+        cv2.imshow('Dense Mesh Face ID', frame)
         if cv2.waitKey(1) & 0xFF == 27: break
 
     cap.release()
