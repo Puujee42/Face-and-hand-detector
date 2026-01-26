@@ -1,0 +1,16 @@
+setup.cfg
+setup.py
+figure.egg-info/PKG-INFO
+figure.egg-info/SOURCES.txt
+figure.egg-info/dependency_links.txt
+figure.egg-info/not-zip-safe
+figure.egg-info/top_level.txt
+figure/circle/__init__.py
+figure/circle/area.py
+figure/circle/perimeter.py
+figure/rectangle/__init__.py
+figure/rectangle/area.py
+figure/rectangle/perimeter.py
+figure/triangle/__init__.py
+figure/triangle/area.py
+figure/triangle/perimeter.py

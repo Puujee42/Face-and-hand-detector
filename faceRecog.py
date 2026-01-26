@@ -111,7 +111,7 @@ if not os.path.exists(image_folder) and os.path.exists("check1.jpg"):
 
 print(f"--- TRAINING ON IMAGES IN '{image_folder}' ---")
 
-for i in range(1, 9):
+for i in range(1, 11):
     filename = os.path.join(image_folder, f"check{i}.jpg")
     if not os.path.exists(filename): continue
     
